@@ -8,9 +8,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     role = Column(String(50))
-    first_name = Column(String(100))
-    last_name = Column(String(100))
-    home_address = Column(String(255))
+    fullname = Column(String(100))
     email = Column(String(255), unique=True, index=True)
     field_of_study = Column(String(255))
     year = Column(Integer)
@@ -31,13 +29,15 @@ class LostItem(Base):
     email = Column(String(255), nullable=False)
     date = Column(TIMESTAMP, nullable=False)
     location = Column(String(255), nullable=False)
-    found = Column(Boolean, default=False)   # True if the item has been found
+    found = Column(Boolean, default=False)
     status = Column(String(50), default="pending")  # pending / approved / rejected
+    item_type = Column(String(50), default="lost")  # lost / found
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)  # Track edits
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", back_populates="lost_items")
     claims = relationship("Claim", back_populates="item", cascade="all, delete-orphan")
+
 
 class Claim(Base):
     __tablename__ = "claims"
