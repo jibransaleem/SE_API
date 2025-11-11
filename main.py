@@ -17,6 +17,7 @@ from auth_models import (
     ClaimResponse
 )
 from email_helper import send_email
+import base64
 
 # ---------------- FastAPI Setup ----------------
 app = FastAPI(title="CEP Lost & Found API")
@@ -35,14 +36,21 @@ def get_db():
 
 # ---------------- Helper Function for Model Serialization ----------------
 def serialize_item(item: LostItem) -> dict:
-    """Convert LostItem ORM object to dict with proper date handling"""
+    """Convert LostItem ORM object to dict with proper date handling and base64 image"""
+    # Convert image blob to base64 string
+    image_base64 = None
+    if item.item_image:
+        image_base64 = base64.b64encode(item.item_image).decode('utf-8')
+    
     return {
         "id": item.id,
         "user_id": item.user_id,
+        "item_type": item.item_type,
         "item_name": item.item_name,
         "item_description": item.item_description,
+        "item_image": image_base64,  # Base64 encoded image
         "email": item.email,
-        "date": item.date.isoformat() if item.date else None,  # Convert date to string
+        "date": item.date.isoformat() if item.date else None,
         "location": item.location,
         "found": item.found,
         "status": item.status,
@@ -79,9 +87,7 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
         hashed_password = pwd_context.hash(user.password)
         new_user = User(
             role=user.role,
-            first_name=user.first_name,
-            last_name=user.last_name,
-            home_address=user.home_address,
+            fullname=user.fullname,
             email=user.email,
             field_of_study=user.field_of_study,
             year=user.year,
@@ -154,8 +160,7 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
                     "user_id": user.id,
                     "role": user.role,
                     "email": user.email,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name
+                    "fullname": user.fullname,
                 }
             }
         )
@@ -182,6 +187,7 @@ def login(credentials: UserLogin, db: Session = Depends(get_db)):
 @app.post("/items/add")
 def add_lost_item(
     user_id: int = Form(...),
+    item_type: str = Form(...),
     item_name: str = Form(...),
     item_description: str = Form(...),
     item_image: UploadFile = File(...),
@@ -198,6 +204,17 @@ def add_lost_item(
                 content={
                     "status": "failed",
                     "message": "User not found",
+                    "data": None
+                }
+            )
+        
+        # Validate item_type
+        if item_type not in ["lost", "found"]:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failed",
+                    "message": "Item type must be either 'lost' or 'found'",
                     "data": None
                 }
             )
@@ -235,13 +252,38 @@ def add_lost_item(
                 }
             )
         
+        # Validate image file
+        if not item_image.content_type.startswith('image/'):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failed",
+                    "message": "Uploaded file must be an image",
+                    "data": None
+                }
+            )
+        
         # Read image bytes
         image_bytes = item_image.file.read()
+        
+        # Validate image size (e.g., max 5MB)
+        max_size = 5 * 1024 * 1024  # 5MB
+        if len(image_bytes) > max_size:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failed",
+                    "message": "Image size must not exceed 5MB",
+                    "data": None
+                }
+            )
+        
         current_date = datetime.utcnow().date()
         
         # Save in database
         new_item = LostItem(
             user_id=user_id,
+            item_type=item_type,
             item_name=item_name,
             item_description=item_description,
             item_image=image_bytes,
@@ -403,18 +445,38 @@ def get_approved_items(db: Session = Depends(get_db)):
         )
 
 @app.get("/items/all")
-def get_all_items(db: Session = Depends(get_db)):
+def get_all_items(item_type: str = None, db: Session = Depends(get_db)):
+    """
+    Get all items, optionally filtered by item_type.
+    - item_type='lost': Items that users have lost
+    - item_type='found': Items that users have found
+    - No item_type: Returns all items
+    """
     try:
-        all_items = db.query(LostItem).all()
+        query = db.query(LostItem)
+        if item_type:
+            # Validate item_type parameter
+            if item_type not in ["lost", "found"]:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "failed",
+                        "message": "Item type must be either 'lost' or 'found'",
+                        "data": None
+                    }
+                )
+            query = query.filter(LostItem.item_type == item_type)
+        
+        items = query.all()
         
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
-                "message": "All items retrieved successfully",
+                "message": "Items retrieved successfully",
                 "data": {
-                    "count": len(all_items),
-                    "items": [serialize_item(i) for i in all_items]
+                    "count": len(items),
+                    "items": [serialize_item(i) for i in items]
                 }
             }
         )
@@ -621,10 +683,12 @@ def mark_as_found(item_id: int, user_id: int, db: Session = Depends(get_db)):
         )
 
 # ---------------- Claim Routes ----------------
-@app.post("/claims")
-def create_claim(claim: ClaimCreate, db: Session = Depends(get_db)):
+
+@app.post("/claim")
+def claim_item(item_id: int, user_id: int, claim_message: str, db: Session = Depends(get_db)):
     try:
-        item = db.query(LostItem).filter(LostItem.id == claim.item_id).first()
+        # Step 1: Find the item
+        item = db.query(LostItem).filter(LostItem.id == item_id).first()
         if not item:
             return JSONResponse(
                 status_code=404,
@@ -634,22 +698,34 @@ def create_claim(claim: ClaimCreate, db: Session = Depends(get_db)):
                     "data": None
                 }
             )
-        
-        # Check if item is approved
+
+        # Step 2: Check if item is approved (regardless of type)
         if item.status != "approved":
             return JSONResponse(
                 status_code=400,
                 content={
                     "status": "failed",
-                    "message": "Cannot claim items that are not approved",
+                    "message": "Items must be approved by admin before claiming",
                     "data": None
                 }
             )
-        
-        # Check if user already claimed this item
+
+        # Step 3: Prevent users from claiming their own items
+        if item.user_id == user_id:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failed",
+                    "message": "You cannot claim your own item",
+                    "data": None
+                }
+            )
+
+        # Step 4: Check if user already has a pending claim for this item
         existing_claim = db.query(Claim).filter(
-            Claim.user_id == claim.user_id,
-            Claim.item_id == claim.item_id
+            Claim.user_id == user_id,
+            Claim.item_id == item_id,
+            Claim.status == "pending"
         ).first()
         
         if existing_claim:
@@ -657,49 +733,58 @@ def create_claim(claim: ClaimCreate, db: Session = Depends(get_db)):
                 status_code=400,
                 content={
                     "status": "failed",
-                    "message": "You have already claimed this item",
+                    "message": "You already have a pending claim for this item",
                     "data": None
                 }
             )
-        
-        new_claim = Claim(
-            user_id=claim.user_id,
-            item_id=claim.item_id,
-            claim_message=claim.claim_message,
+
+        # Step 5: Validate claim message
+        if not claim_message or len(claim_message.strip()) < 10:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "failed",
+                    "message": "Claim message must be at least 10 characters",
+                    "data": None
+                }
+            )
+
+        # Step 6: Create a new claim
+        claim = Claim(
+            user_id=user_id,
+            item_id=item_id,
+            claim_message=claim_message.strip(),
             status="pending",
             created_at=datetime.utcnow()
         )
-        db.add(new_claim)
+        db.add(claim)
         db.commit()
-        db.refresh(new_claim)
-        
+        db.refresh(claim)
+
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success",
                 "message": "Claim submitted successfully",
-                "data": {"claim_id": new_claim.id}
+                "data": {
+                    "claim_id": claim.id,
+                    "item_id": claim.item_id,
+                    "status": claim.status
+                }
             }
         )
-    except ValidationError as ve:
-        return JSONResponse(
-            status_code=422,
-            content={
-                "status": "failed",
-                "message": f"Validation error: {str(ve)}",
-                "data": None
-            }
-        )
+
     except Exception as e:
         db.rollback()
         return JSONResponse(
             status_code=500,
             content={
                 "status": "failed",
-                "message": f"Failed to create claim: {str(e)}",
+                "message": f"Failed to submit claim: {str(e)}",
                 "data": None
             }
         )
+
 
 @app.get("/claims/pending")
 def get_pending_claims(db: Session = Depends(get_db)):
